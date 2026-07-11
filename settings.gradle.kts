@@ -1,5 +1,6 @@
 rootProject.name = "payments-ledger-demo"
 
-// Phase 1 — pure-Java 21 domain sub-module only.
-// Later phases add: ledger-application, ledger-infrastructure, ledger-app (Spring Boot host).
+// Phase 2 — ledger-domain + ledger-application.
+// Later phases add: ledger-infrastructure, ledger-app (Spring Boot host).
 include(":ledger-domain")
+include(":ledger-application")

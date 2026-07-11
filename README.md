@@ -4,14 +4,14 @@ A double-entry accounting ledger with Kafka-based payment ingestion, event sourc
 
 > A senior backend interviewer will ask you three things about a payments system: how you keep the books balanced, how you handle idempotency, and how you deliver events without double-publishing. This repo answers all three.
 
-**Status: Phase 1 of 5 — Domain module only.**
+**Status: Phase 2 of 5 — Application layer.**
 
 ## Phases
 
 | Phase | Ships | Status |
 | --- | --- | --- |
 | **1 — Domain** | Java 21 records: `Money` (BigDecimal + currency safety), `Posting`, `LedgerEntry` (balancing invariant in the constructor). Service interfaces (ports). Domain events as a sealed interface hierarchy. Unit tests. Zero framework deps. | **done** |
-| **2 — Application** | Use cases (PostPayment, ReplayPayment), idempotency wrapper, in-memory handler tests. | pending |
+| **2 — Application** | `PostPaymentUseCase` with idempotency + sufficient-funds check, `CreateAccountUseCase`, `GetAccountBalanceUseCase`. Sealed `PostPaymentResult` for the three outcomes. Full test suite over in-memory fakes. | **done** |
 | **3 — Infrastructure** | Postgres + JPA event store + outbox table + Flyway migration. | pending |
 | **4 — Kafka** | Consumer for inbound `PaymentSubmitted`, outbox-relay worker publishing to `PaymentPosted`. | pending |
 | **5 — Boot host + REST + Docker + CI** | Runnable Spring Boot app, docker-compose (Postgres + Kafka + app), CI, architecture diagrams. | pending |
@@ -32,6 +32,25 @@ The interesting types:
 - **Services** — `DoubleEntryValidator` for rules beyond balancing, `LedgerPoster` that turns a `PaymentInstruction` into a balanced entry.
 
 Fifteen JUnit 5 tests covering `Money` arithmetic + safety, the `LedgerEntry` balancing invariant (including a multi-currency case), and `LedgerPoster` mapping.
+
+## What Phase 2 gives you
+
+`ledger-application` — a second Gradle sub-module that depends on `ledger-domain` and nothing else. No Spring, no JPA, no Kafka. The compiler enforces it.
+
+- **`PostPaymentUseCase`** — the write path for a payment. Runs the full pipeline: idempotency short-circuit → account lookups → active checks → currency alignment → sufficient-funds check → post + record idempotency + publish `PaymentPostedEvent`. Rejections short-circuit with a `PostPaymentResult.Rejected` and publish a `PaymentFailedEvent` for downstream systems.
+- **`PostPaymentResult`** — sealed interface with three cases: `PostedNew`, `AlreadyPosted`, `Rejected`. Callers pattern-match; new cases would force every switch to handle them.
+- **`CreateAccountUseCase`** — provisions accounts, publishes `AccountCreatedEvent`.
+- **`GetAccountBalanceUseCase`** — read-side query that delegates to the store port so a Phase 3 projection swap doesn't touch this class.
+
+**Tests** — 12 across three test classes running against in-memory fakes (`InMemoryAccountRepository`, `InMemoryLedgerEntryStore`, `InMemoryIdempotencyStore`, `CapturingOutboxPublisher`, `FixedClock`). A shared `LedgerTestFixture` wires the DI graph in one line per test. The Postgres implementation in Phase 3 will not require any of these tests to change — the ports are the seam.
+
+Key scenarios covered:
+- Happy path (write, idempotency, event, balance update)
+- **Duplicate submission returns `AlreadyPosted` with the same entry id, no double-write, no double-event** — this is the effectively-once story working end-to-end
+- Missing / inactive account (both from and to)
+- Currency mismatch
+- Insufficient funds (with a boundary test for exact-balance-allowed)
+- Multi-payment balance accumulation
 
 ## Build (Phase 1)
 
