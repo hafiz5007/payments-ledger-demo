@@ -4,7 +4,7 @@ A double-entry accounting ledger with Kafka-based payment ingestion, event sourc
 
 > A senior backend interviewer will ask you three things about a payments system: how you keep the books balanced, how you handle idempotency, and how you deliver events without double-publishing. This repo answers all three.
 
-**Status: Phase 2 of 5 — Application layer.**
+**Status: Phase 3 of 5 — Infrastructure (Postgres + JPA + outbox).**
 
 ## Phases
 
@@ -12,7 +12,7 @@ A double-entry accounting ledger with Kafka-based payment ingestion, event sourc
 | --- | --- | --- |
 | **1 — Domain** | Java 21 records: `Money` (BigDecimal + currency safety), `Posting`, `LedgerEntry` (balancing invariant in the constructor). Service interfaces (ports). Domain events as a sealed interface hierarchy. Unit tests. Zero framework deps. | **done** |
 | **2 — Application** | `PostPaymentUseCase` with idempotency + sufficient-funds check, `CreateAccountUseCase`, `GetAccountBalanceUseCase`. Sealed `PostPaymentResult` for the three outcomes. Full test suite over in-memory fakes. | **done** |
-| **3 — Infrastructure** | Postgres + JPA event store + outbox table + Flyway migration. | pending |
+| **3 — Infrastructure** | Postgres 16 + JPA + Flyway migration. JPA entities + Spring Data repositories + adapters implementing every Domain port. Balance projection table updated in the same transaction as postings. Outbox table with JSONB payloads + partial index on unsent rows. Jackson-based event serialiser. Single `@Configuration` wires it all up. | **done** |
 | **4 — Kafka** | Consumer for inbound `PaymentSubmitted`, outbox-relay worker publishing to `PaymentPosted`. | pending |
 | **5 — Boot host + REST + Docker + CI** | Runnable Spring Boot app, docker-compose (Postgres + Kafka + app), CI, architecture diagrams. | pending |
 
@@ -51,6 +51,36 @@ Key scenarios covered:
 - Currency mismatch
 - Insufficient funds (with a boundary test for exact-balance-allowed)
 - Multi-payment balance accumulation
+
+## What Phase 3 gives you
+
+`ledger-infrastructure` — the Spring Data JPA + Postgres implementation of every Domain port. This module DOES depend on Spring; that's what infrastructure is for.
+
+### Schema (Flyway `V1__initial_schema.sql`)
+
+Six tables. Key design points:
+
+- **`ledger_entries` + `postings`** are separate tables joined by `ledger_entry_id`. Postings sit on the many side because a single entry can hit 2, 3, or N accounts (the domain enforces balancing per currency; SQL doesn't try to).
+- **`account_balances`** is a projection table, not a materialized view — one row per account, `amount` + `currency`, updated in the same JPA transaction as posting inserts. Reads are O(1). A nightly reconciliation job (roadmap) checks the projection against `SUM(postings.signed_amount)` and alerts on drift.
+- **`idempotency_keys`** — `TransactionId → LedgerEntryId`. The primary key catches concurrent submitters at the DB level: two POST requests for the same idempotency key can't both create ledger entries because the second `INSERT` fails.
+- **`outbox`** — pending events awaiting Kafka. JSONB payload (so we can query on payload fields when we need to). **Partial index on `sent_at IS NULL`** so the relay's "pending" scan stays cheap as the sent table grows to millions of rows.
+
+### Adapters
+
+Each Domain port has a JPA-backed implementation:
+
+- **`JpaAccountRepository`** — CRUD via `AccountJpaRepository`. On new-account save, bootstraps a zero-balance row in `account_balances` so subsequent postings can assume it exists.
+- **`JpaLedgerEntryStore`** — the substantive one. `append(entry)` inserts the entry header, N posting rows, and updates N balance projections in a single transaction. `findByIdForUpdate` on the balance row (SELECT ... FOR UPDATE) serialises concurrent posters on the same account.
+- **`JpaIdempotencyStore`** — insert on `record`, lookup on `findExistingEntry`. Primary key uniqueness enforces the invariant.
+- **`JpaOutboxPublisher`** — serialises the `DomainEvent` to JSON via `DomainEventJsonMapper` and inserts one outbox row. Runs inside the same transaction as the ledger write, so a mid-flight crash rolls both back.
+
+### Event serialisation
+
+`DomainEventJsonMapper` uses Jackson to turn a `DomainEvent` into `(event_type, aggregate_id, JSON payload)`. Domain has zero Jackson dependency; serialisation lives at this layer. The `aggregate_id` is what Kafka partitions on: all events for one payment / one account go to the same partition, preserving downstream ordering.
+
+### Wiring
+
+One `@Configuration` class (`InfrastructureConfig`) exposes every port as a Spring bean. Phase 5's Boot host imports it with a single annotation. No component scanning across module boundaries — every bean is defined explicitly.
 
 ## Build (Phase 1)
 
