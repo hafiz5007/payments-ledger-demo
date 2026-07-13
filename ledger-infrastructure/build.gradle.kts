@@ -23,6 +23,9 @@ dependencies {
     // Spring Data JPA + JDBC — the adapter surface. Managed by the BOM.
     implementation("org.springframework.boot:spring-boot-starter-data-jpa")
 
+    // Spring Kafka — inbound PaymentSubmitted consumer + outbox relay producer.
+    implementation("org.springframework.kafka:spring-kafka")
+
     // Postgres driver + Flyway migrations.
     implementation("org.postgresql:postgresql")
     implementation("org.flywaydb:flyway-core")

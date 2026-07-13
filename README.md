@@ -4,7 +4,7 @@ A double-entry accounting ledger with Kafka-based payment ingestion, event sourc
 
 > A senior backend interviewer will ask you three things about a payments system: how you keep the books balanced, how you handle idempotency, and how you deliver events without double-publishing. This repo answers all three.
 
-**Status: Phase 3 of 5 — Infrastructure (Postgres + JPA + outbox).**
+**Status: Phase 4 of 5 — Kafka consumer + outbox relay.**
 
 ## Phases
 
@@ -13,7 +13,7 @@ A double-entry accounting ledger with Kafka-based payment ingestion, event sourc
 | **1 — Domain** | Java 21 records: `Money` (BigDecimal + currency safety), `Posting`, `LedgerEntry` (balancing invariant in the constructor). Service interfaces (ports). Domain events as a sealed interface hierarchy. Unit tests. Zero framework deps. | **done** |
 | **2 — Application** | `PostPaymentUseCase` with idempotency + sufficient-funds check, `CreateAccountUseCase`, `GetAccountBalanceUseCase`. Sealed `PostPaymentResult` for the three outcomes. Full test suite over in-memory fakes. | **done** |
 | **3 — Infrastructure** | Postgres 16 + JPA + Flyway migration. JPA entities + Spring Data repositories + adapters implementing every Domain port. Balance projection table updated in the same transaction as postings. Outbox table with JSONB payloads + partial index on unsent rows. Jackson-based event serialiser. Single `@Configuration` wires it all up. | **done** |
-| **4 — Kafka** | Consumer for inbound `PaymentSubmitted`, outbox-relay worker publishing to `PaymentPosted`. | pending |
+| **4 — Kafka** | `PaymentSubmitted` consumer with exponential-backoff retry → DLT on failure. Transactional `PostPaymentService` wrapper — one JPA transaction covers entry + postings + balance + outbox write. Outbox relay worker on a fixed cadence: read pending → publish to Kafka → mark sent. Named per-topic mapping (`payments.posted`, `payments.failed`, `accounts.created`) via `LedgerTopics`. Idempotent producer + `acks=all` + read-committed consumer. | **done** |
 | **5 — Boot host + REST + Docker + CI** | Runnable Spring Boot app, docker-compose (Postgres + Kafka + app), CI, architecture diagrams. | pending |
 
 Read the git history — each phase is a single commit that stands on its own.
@@ -81,6 +81,46 @@ Each Domain port has a JPA-backed implementation:
 ### Wiring
 
 One `@Configuration` class (`InfrastructureConfig`) exposes every port as a Spring bean. Phase 5's Boot host imports it with a single annotation. No component scanning across module boundaries — every bean is defined explicitly.
+
+## What Phase 4 gives you
+
+Kafka in both directions.
+
+### The transactional seam
+
+`PostPaymentService` is a Spring `@Service` with a single `@Transactional` method that delegates to `PostPaymentUseCase`. That's where the DB + outbox atomicity lives: the entry write, the N posting writes, the N balance-projection updates, and the outbox insert all sit inside one JPA transaction. Roll back the transaction and none of them persist; commit and all of them do. The Application module stays framework-free — the Spring boundary lives in Infrastructure where it belongs.
+
+Both the Kafka consumer and (in Phase 5) the REST controller call this service. Nowhere else touches `PostPaymentUseCase` directly, so nowhere else can skip the transaction.
+
+### Inbound: `PaymentSubmittedConsumer`
+
+`@KafkaListener` on `payments.submitted`. Deserialises the wire JSON into `PaymentSubmittedMessage`, maps to `PaymentInstruction`, calls `PostPaymentService.execute`, logs the outcome. Consumer factory is manual-commit (`enable.auto.commit=false`) so the Kafka offset only advances after the DB transaction commits.
+
+Error handling via `DefaultErrorHandler` + `DeadLetterPublishingRecoverer`: 3 attempts with exponential backoff (200ms → 400ms → 800ms), then the message is published to `payments.submitted.dlt`. That handles both transient failures (DB deadlock, network flake) and poison pills (malformed JSON — routed straight to DLT because the parse throws `IllegalArgumentException`, which is not retryable in the standard classifier).
+
+**Effectively-once processing** holds because the Application's idempotency check (`TransactionId → LedgerEntryId`) short-circuits a redelivered message. So the three failure modes resolve as:
+
+- DB commit success, offset commit success → normal path.
+- DB commit success, offset commit failure → message redelivered, idempotency store recognises it, `AlreadyPosted` returned, no double-write.
+- DB commit failure → rollback, offset not committed, retry via the error handler, DLT after retries exhausted.
+
+### Outbound: `OutboxRelayWorker`
+
+`@Scheduled` sweep on a configurable cadence (default 1s). Reads a batch of unsent outbox rows in `created_at ASC` order via the partial index. For each row: publish synchronously to the correct topic (via `LedgerTopics` mapping), mark `sent_at`. On any publish failure the batch halts — the next tick retries from the same failed row, preserving per-aggregate order.
+
+Producer: idempotent + `acks=all` so the Kafka broker never accepts a duplicate on retry and never acks until every in-sync replica has the message. The delivery guarantee is at-least-once; downstream consumers must be idempotent on the outbox row's UUID (the event id).
+
+### Topics
+
+Named in one place (`LedgerTopics`):
+
+- `payments.submitted` — inbound
+- `payments.posted`, `payments.failed`, `accounts.created` — outbound (via outbox)
+- `payments.submitted.dlt` — auto-populated by the error handler
+
+### Config
+
+`OutboxRelayProperties` binds `ledger.outbox.poll-interval` and `ledger.outbox.batch-size` from `application.yml`. Sensible defaults so a fresh boot just works.
 
 ## Build (Phase 1)
 
