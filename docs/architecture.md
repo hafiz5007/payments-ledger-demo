@@ -16,17 +16,19 @@
 sequenceDiagram
     participant Client
     participant API as PaymentsController
-    participant Service as PostPaymentService @Transactional
+    participant Service as PostPaymentService
     participant UseCase as PostPaymentUseCase
     participant Idem as JpaIdempotencyStore
     participant Accts as JpaAccountRepository
     participant Ledger as JpaLedgerEntryStore
     participant Outbox as JpaOutboxPublisher
     participant DB as Postgres
+    participant Relay as OutboxRelayWorker
+    participant Kafka
 
-    Client->>API: POST /api/v1/payments (idempotency key)
+    Client->>API: POST /api/v1/payments
     API->>Service: execute(instruction)
-    Note over Service: @Transactional BEGIN
+    Note over Service: Transactional BEGIN
 
     Service->>UseCase: execute(instruction)
     UseCase->>Idem: findExistingEntry(txId)
@@ -42,8 +44,8 @@ sequenceDiagram
 
     UseCase->>Ledger: append(entry)
     Ledger->>DB: INSERT ledger_entries
-    Ledger->>DB: INSERT postings × N
-    Ledger->>DB: UPDATE account_balances × N (SELECT FOR UPDATE)
+    Ledger->>DB: INSERT postings x N
+    Ledger->>DB: UPDATE account_balances x N
 
     UseCase->>Idem: record(txId, entryId)
     Idem->>DB: INSERT idempotency_keys
@@ -51,16 +53,14 @@ sequenceDiagram
     UseCase->>Outbox: publish(PaymentPostedEvent)
     Outbox->>DB: INSERT outbox
 
-    Note over Service: @Transactional COMMIT
+    Note over Service: Transactional COMMIT
 
     Service-->>API: PostedNew
     API-->>Client: 201 Created
 
-    Note over DB,Outbox: — later, on the outbox relay tick —
+    Note over DB,Outbox: -- later, on the outbox relay tick --
 
-    participant Relay as OutboxRelayWorker
-    participant Kafka
-    Relay->>DB: SELECT unsent (partial index)
+    Relay->>DB: SELECT unsent
     Relay->>Kafka: send(payments.posted, payload)
     Kafka-->>Relay: ack
     Relay->>DB: UPDATE outbox SET sent_at
@@ -77,15 +77,15 @@ sequenceDiagram
     participant DB
 
     Note over Client: Client retries the same request
-    Client->>API: POST /api/v1/payments (same txId)
+    Client->>API: POST /api/v1/payments same txId
     API->>UseCase: execute(instruction)
     UseCase->>Idem: findExistingEntry(txId)
     Idem->>DB: SELECT
     DB-->>Idem: previous entryId
     UseCase-->>API: AlreadyPosted(entryId)
-    API-->>Client: 200 OK { outcome: AlreadyPosted, ledgerEntryId }
+    API-->>Client: 200 OK outcome AlreadyPosted
 
-    Note over API: No writes. No new event.<br/>Balances unchanged.
+    Note over API: No writes. No new event. Balances unchanged.
 ```
 
 ## Why an outbox instead of publishing directly to Kafka?

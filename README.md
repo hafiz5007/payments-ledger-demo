@@ -18,28 +18,28 @@ A double-entry accounting ledger with Kafka-based payment ingestion, event sourc
 ```mermaid
 flowchart LR
     subgraph Ingest["Inbound"]
-        Client[REST client]
-        Producer[Upstream producer]
+        Client["REST client"]
+        Producer["Upstream producer"]
     end
 
-    subgraph App["payments-ledger (Spring Boot)"]
-        REST[REST controllers<br/>@Transactional]
-        Consumer[Kafka listener<br/>PaymentSubmitted]
-        UseCase[PostPaymentUseCase<br/>pure Java]
-        Relay[OutboxRelayWorker<br/>@Scheduled]
+    subgraph App["payments-ledger Spring Boot"]
+        REST["REST controllers<br/>Transactional"]
+        Consumer["Kafka listener<br/>PaymentSubmitted"]
+        UseCase["PostPaymentUseCase<br/>pure Java"]
+        Relay["OutboxRelayWorker<br/>Scheduled"]
     end
 
     subgraph Storage
-        DB[(Postgres 16<br/>ledger_entries<br/>postings<br/>account_balances<br/>idempotency_keys<br/>outbox)]
+        DB[("Postgres 16<br/>ledger_entries<br/>postings<br/>account_balances<br/>idempotency_keys<br/>outbox")]
     end
 
     subgraph Egress["Outbound"]
-        Kafka[(Kafka topics<br/>payments.posted<br/>payments.failed<br/>accounts.created)]
-        Downstream[Downstream services<br/>notifications, fraud, ...]
+        Kafka[("Kafka topics<br/>payments.posted<br/>payments.failed<br/>accounts.created")]
+        Downstream["Downstream services<br/>notifications, fraud, ..."]
     end
 
-    Client -->|POST /api/v1/payments| REST
-    Producer -->|payments.submitted| Consumer
+    Client -->|"POST /api/v1/payments"| REST
+    Producer -->|"payments.submitted"| Consumer
     REST --> UseCase
     Consumer --> UseCase
     UseCase --> DB
